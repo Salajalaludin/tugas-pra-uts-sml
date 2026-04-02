@@ -1,0 +1,17 @@
+---
+title: "Pengantar Metode Statistika Tugas 3"
+author: "Sala Jalaludin"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float:
+        collapsed: true
+        smooth_scroll: true
+    theme: cosmo
+---
+
+# Input Data
+```{r}
+```
