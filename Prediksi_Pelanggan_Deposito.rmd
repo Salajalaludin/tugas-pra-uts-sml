@@ -13,5 +13,172 @@ output:
 ---
 
 # Input Data
+
 ```{r}
+train <- read.csv("dataset_A.csv", stringsAsFactors = FALSE)
+test <- read.csv("dataset_B.csv", stringsAsFactors = FALSE)
+```
+
+```{r}
+cat("Dimensi Dataset A:", dim(train), "\n")
+cat("Dimensi Dataset B:", dim(test), "\n\n")
+```
+# Eksplorasi Data
+```{r}
+str(train)
+summary(train)
+```
+```{r}
+str(test)
+summary(test)
+```
+
+# Preprocessing Data
+```{r}
+# handling missing value
+# unknown menjadi NA
+train[train == "unknown"] <- NA
+test[test == "unknown"] <- NA
+
+# Pencari modus
+get_mode <- function(x) {
+  x <- na.omit(x) # hapus NA sementara
+  ux <- unique(x)
+  ux[which.max(tabulate(match(x, ux)))]
+}
+
+# Imputasi NA dengan modus di data Train
+for(col in names(train)) {
+  if(any(is.na(train[[col]]))) {
+    train[[col]][is.na(train[[col]])] <- get_mode(train[[col]])
+  }
+}
+
+# Imputasi NA dengan modus pada data Test
+for(col in names(test)) {
+  if(any(is.na(test[[col]]))) {
+    test[[col]][is.na(test[[col]])] <- get_mode(test[[col]])
+  }
+}
+```
+
+```{r}
+# feature engineering
+# Membuat kolom baru 'is_contacted_before' (yes/no) berdasarkan nilai pdays 
+train$is_contacted_before <- ifelse(train$pdays == 999, "no", "yes")
+test$is_contacted_before <- ifelse(test$pdays == 999, "no", "yes")
+```
+```{r}
+# feature selection & anti data leakage
+
+# hapus 'duration'
+train <- train[, !(names(train) %in% c("duration"))]
+test <- test[, !(names(test) %in% c("duration"))]
+
+# Hapus 'emp.var.rate' dan 'nr.employed' untuk mengurangi multikolinearitas
+kolom_dihapus <- c("emp.var.rate", "nr.employed")
+train <- train[, !(names(train) %in% kolom_dihapus)]
+test <- test[, !(names(test) %in% kolom_dihapus)]
+
+cat("\nVariabel tersisa setelah Feature Selection:\n")
+print(names(train))
+```
+
+```{r}
+# konversi tipe data
+# Mengubah semua kolom bertipe character menjadi factor
+train[sapply(train, is.character)] <- lapply(train[sapply(train, is.character)], as.factor) # nolint
+test[sapply(test, is.character)] <- lapply(test[sapply(test, is.character)], as.factor) #nolint
+
+# Menyamakan levels factor pada data Test dengan data Train
+for(col in names(test)) {
+  if(is.factor(test[[col]]) && col %in% names(train)) {
+    levels(test[[col]]) <- levels(train[[col]])
+  }
+}
+```
+
+```{r}
+# bagi data Train menjadi data Train dan data Validation
+set.seed(123)
+trainIndex <- createDataPartition(train$y, p = 0.8, list = FALSE) #nolint
+data_train <- train[trainIndex, ]
+data_val <- train[-trainIndex, ]
+
+# handling class imbalance dengan downsampling
+train_balanced <- downSample(x = data_train[, -which(names(data_train) == "y")],
+                             y = data_train$y, 
+                             yname = "y")
+```
+
+```{r}
+# cek preprocessing
+cat("\nData train_balanced\n")
+cat("Jumlah baris dan kolom:\n")
+print(dim(train_balanced))
+
+cat("\nCek tipe data 'pdays' dan 'is_contacted_before':\n")
+print(class(train_balanced$pdays))
+print(class(train_balanced$is_contacted_before))
+
+cat("\nProporsi Kelas Target (y):\n")
+print(table(train_balanced$y))
+```
+
+```{r}
+# Model development
+library(caret) # evaluasi
+library(randomForest) # random forest
+library(e1071) # SVM
+library(MLmetrics) # f1-score
+library(nnet) # ANN
+```
+
+```{r}
+# Membangun Model Random Forest
+set.seed(123)
+# ntree = 100, efisien
+model_rf <- randomForest(y ~ ., data = train_balanced, ntree = 100, importance = TRUE)
+
+# Membangun Model SVM
+set.seed(123)
+# Kernel radial
+model_svm <- svm(y ~ ., data = train_balanced, kernel = "radial", probability = TRUE)
+
+# Membangun Model ANN
+set.seed(123)
+# Menggunakan arsitektur 1 hidden layer dengan 5 neuron (size = 5) 
+model_ann <- nnet(y ~ ., data = train_balanced, size = 5, decay = 0.01, maxit = 300, trace = FALSE)
+```
+
+```{r}
+# Evaluasi model pada data Validation
+cat("\nMelakukan Prediksi pada Data Validasi\n")
+
+# Prediksi
+pred_rf <- predict(model_rf, newdata = data_val)
+pred_svm <- predict(model_svm, newdata = data_val)
+pred_ann_raw <- predict(model_ann, newdata = data_val, type = "class")
+pred_ann <- as.factor(pred_ann_raw)
+
+# Confusion Matrix
+cm_rf <- confusionMatrix(pred_rf, data_val$y, positive = "yes")
+cm_svm <- confusionMatrix(pred_svm, data_val$y, positive = "yes")
+cm_ann <- confusionMatrix(pred_ann, data_val$y, positive = "yes")
+
+# F1-Score
+f1_rf <- F1_Score(y_pred = pred_rf, y_true = data_val$y, positive = "yes")
+f1_svm <- F1_Score(y_pred = pred_svm, y_true = data_val$y, positive = "yes")
+f1_ann <- F1_Score(y_pred = pred_ann, y_true = data_val$y, positive = "yes")
+
+# Ringkasan Evaluasi
+cat("\nHASIL EVALUASI KOMPARATIF\n")
+eval_results <- data.frame(
+  Model = c("Random Forest", "SVM", "ANN"),
+  Accuracy = c(cm_rf$overall['Accuracy'], cm_svm$overall['Accuracy'], cm_ann$overall['Accuracy']),
+  Precision = c(cm_rf$byClass['Pos Pred Value'], cm_svm$byClass['Pos Pred Value'], cm_ann$byClass['Pos Pred Value']),
+  Recall = c(cm_rf$byClass['Sensitivity'], cm_svm$byClass['Sensitivity'], cm_ann$byClass['Sensitivity']),
+  F1_Score = c(f1_rf, f1_svm, f1_ann)
+)
+print(eval_results)
 ```
