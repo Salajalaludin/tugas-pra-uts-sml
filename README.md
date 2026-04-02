@@ -1,3 +1,4 @@
+ HEAD
 Bank Term Deposit Subscription Prediction
 Proyek ini bertujuan untuk membangun model klasifikasi machine learning yang mampu memprediksi apakah seorang nasabah akan berlangganan produk deposito berjangka (term deposit) berdasarkan karakteristik demografi, riwayat interaksi, dan indikator ekonomi.
 
@@ -22,3 +23,5 @@ Bank ingin meningkatkan efektivitas pemasaran. Masalah utama dalam dataset ini s
 📊 Evaluasi
 
 📝 Output Prediksi
+
+dae85ecc2449e389cf7cff76c4a1cf9158976337
