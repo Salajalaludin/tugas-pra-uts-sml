@@ -135,44 +135,55 @@ library(nnet) # ANN
 ```
 
 ```{r}
-# Membangun Model Random Forest
-set.seed(123)
-# ntree = 100, efisien
-model_rf <- randomForest(y ~ ., data = train_balanced, ntree = 100, importance = TRUE)
+# Scaling data numerik
 
-# Membangun Model SVM
-set.seed(123)
-# Kernel radial
-model_svm <- svm(y ~ ., data = train_balanced, kernel = "radial", probability = TRUE)
+# identifikasi numerik/integer
+numeric_cols <- sapply(train_balanced, is.numeric)
 
-# Membangun Model ANN
-set.seed(123)
-# Menggunakan arsitektur 1 hidden layer dengan 5 neuron (size = 5) 
-model_ann <- nnet(y ~ ., data = train_balanced, size = 5, decay = 0.01, maxit = 300, trace = FALSE)
+# aturan scaling (Z-score: mean=0, sd=1)
+scaler <- preProcess(train_balanced[, numeric_cols], method = c("center", "scale"))
+
+# Menerapkan aturan scaling ke data Train, Validation, dan Test
+train_balanced_scaled <- train_balanced
+train_balanced_scaled[, numeric_cols] <- predict(scaler, train_balanced[, numeric_cols])
+
+data_val_scaled <- data_val
+data_val_scaled[, numeric_cols] <- predict(scaler, data_val[, numeric_cols])
 ```
 
 ```{r}
-# Evaluasi model pada data Validation
-cat("\nMelakukan Prediksi pada Data Validasi\n")
+# Random Forest
+set.seed(123)
+model_rf <- randomForest(y ~ ., data = train_balanced_scaled, mtry = 2, ntree = 100, importance = TRUE)
 
-# Prediksi
-pred_rf <- predict(model_rf, newdata = data_val)
-pred_svm <- predict(model_svm, newdata = data_val)
-pred_ann_raw <- predict(model_ann, newdata = data_val, type = "class")
+# SVM
+set.seed(123)
+model_svm <- svm(y ~ ., data = train_balanced_scaled, kernel = "radial", probability = TRUE)
+
+# ANN
+set.seed(123)
+model_ann <- nnet(y ~ ., data = train_balanced_scaled, size = 5, decay = 0.01, maxit = 300, trace = FALSE)
+```
+
+```{r}
+# evaluasi model dasar
+
+# Prediksi menggunakan data validasi yang sudah di-scale
+pred_rf <- predict(model_rf, newdata = data_val_scaled)
+pred_svm <- predict(model_svm, newdata = data_val_scaled)
+pred_ann_raw <- predict(model_ann, newdata = data_val_scaled, type = "class")
 pred_ann <- as.factor(pred_ann_raw)
 
-# Confusion Matrix
-cm_rf <- confusionMatrix(pred_rf, data_val$y, positive = "yes")
-cm_svm <- confusionMatrix(pred_svm, data_val$y, positive = "yes")
-cm_ann <- confusionMatrix(pred_ann, data_val$y, positive = "yes")
+# Evaluasi
+cm_rf <- confusionMatrix(pred_rf, data_val_scaled$y, positive = "yes")
+cm_svm <- confusionMatrix(pred_svm, data_val_scaled$y, positive = "yes")
+cm_ann <- confusionMatrix(pred_ann, data_val_scaled$y, positive = "yes")
 
-# F1-Score
-f1_rf <- F1_Score(y_pred = pred_rf, y_true = data_val$y, positive = "yes")
-f1_svm <- F1_Score(y_pred = pred_svm, y_true = data_val$y, positive = "yes")
-f1_ann <- F1_Score(y_pred = pred_ann, y_true = data_val$y, positive = "yes")
+f1_rf <- F1_Score(y_pred = pred_rf, y_true = data_val_scaled$y, positive = "yes")
+f1_svm <- F1_Score(y_pred = pred_svm, y_true = data_val_scaled$y, positive = "yes")
+f1_ann <- F1_Score(y_pred = pred_ann, y_true = data_val_scaled$y, positive = "yes")
 
-# Ringkasan Evaluasi
-cat("\nHASIL EVALUASI KOMPARATIF\n")
+cat("\n[ HASIL EVALUASI KOMPARATIF DASAR ]\n")
 eval_results <- data.frame(
   Model = c("Random Forest", "SVM", "ANN"),
   Accuracy = c(cm_rf$overall['Accuracy'], cm_svm$overall['Accuracy'], cm_ann$overall['Accuracy']),
@@ -181,4 +192,73 @@ eval_results <- data.frame(
   F1_Score = c(f1_rf, f1_svm, f1_ann)
 )
 print(eval_results)
+```
+
+```{r}
+# kalibrasi model
+batas_probabilitas <- 0.67
+
+# ANN KALIBRASI
+prob_ann <- as.numeric(predict(model_ann, newdata = data_val_scaled, type = "raw"))
+pred_ann_kalibrasi <- as.factor(ifelse(prob_ann > batas_probabilitas, "yes", "no"))
+levels(pred_ann_kalibrasi) <- levels(data_val_scaled$y)
+
+cm_ann_kalibrasi <- confusionMatrix(pred_ann_kalibrasi, data_val_scaled$y, positive = "yes")
+f1_ann_kalibrasi <- F1_Score(y_pred = pred_ann_kalibrasi, y_true = data_val_scaled$y, positive = "yes")
+
+# SVM KALIBRASI
+pred_svm_raw <- predict(model_svm, newdata = data_val_scaled, probability = TRUE)
+prob_svm <- attr(pred_svm_raw, "probabilities")[, "yes"]
+
+pred_svm_kalibrasi <- as.factor(ifelse(prob_svm > batas_probabilitas, "yes", "no"))
+levels(pred_svm_kalibrasi) <- levels(data_val_scaled$y)
+
+cm_svm_kalibrasi <- confusionMatrix(pred_svm_kalibrasi, data_val_scaled$y, positive = "yes")
+f1_svm_kalibrasi <- F1_Score(y_pred = pred_svm_kalibrasi, y_true = data_val_scaled$y, positive = "yes")
+
+# Hasil
+cat("\n[ HASIL F1-SCORE SEBELUM VS SESUDAH KALIBRASI (Threshold =", batas_probabilitas, ") ]\n")
+cat("ANN - Sebelum :", f1_ann, " | Sesudah :", f1_ann_kalibrasi, "\n")
+cat("SVM - Sebelum :", f1_svm, " | Sesudah :", f1_svm_kalibrasi, "\n")
+```
+
+```{r}
+# ==========================================
+# A. PERSIAPAN DATA TEST (SCALING)
+# ==========================================
+# Membuat salinan dari data test yang sudah dipreprocessing
+test_scaled <- test
+
+# Menerapkan aturan scaling (dari objek 'scaler' yang dibuat di tahap sebelumnya)
+# ke kolom-kolom numerik pada Dataset B
+test_scaled[, numeric_cols] <- predict(scaler, test[, numeric_cols])
+
+cat("Data Dataset B berhasil di-scale!\n")
+
+
+# ==========================================
+# B. PREDIKSI DATASET B & EXPORT
+# ==========================================
+cat("\n=== MEMPREDIKSI DATASET B & EXPORT ===\n")
+
+# Melakukan prediksi dengan model Random Forest
+prediksi_final <- predict(model_rf, newdata = test_scaled)
+
+# Membuat dataframe baru KHUSUS untuk submission sesuai format
+# id: urutan dari 1 sampai jumlah baris data test
+# y_pred: hasil tebakan (yes/no)
+hasil_submission <- data.frame(
+  id = seq_len(nrow(test_scaled)),
+  y_pred = prediksi_final
+)
+
+# Menampilkan 5 baris pertama untuk memastikan formatnya sudah tepat
+cat("\nPreview Format Data:\n")
+print(head(hasil_submission, 5))
+
+# Meng-export dataframe ke dalam format .csv
+# quote = FALSE menghilangkan tanda kutip ganda pada output
+write.csv(hasil_submission, "Hasil_Prediksi_Dataset_B.csv", row.names = FALSE, quote = FALSE)
+
+cat("\n[SELESAI] File telah berhasil disimpan dengan format 'id,y_pred'.\n")
 ```

@@ -1,0 +1,615 @@
+---
+title: "Pengantar Metode Statistika Tugas 3"
+author: "Sala Jalaludin"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float:
+        collapsed: true
+        smooth_scroll: true
+    theme: cosmo
+---
+
+# Load Library
+```{r}
+library(caret)
+library(randomForest)
+library(e1071)
+library(MLmetrics)
+library(nnet)
+```
+
+# Input Data
+```{r}
+train <- read.csv("dataset_A.csv", stringsAsFactors = FALSE)
+test  <- read.csv("dataset_B.csv", stringsAsFactors = FALSE)
+
+cat("Dimensi Dataset A:", dim(train), "\n")
+cat("Dimensi Dataset B:", dim(test),  "\n")
+```
+
+# Eksplorasi Data
+```{r}
+cat("\n=== TIPE DATA ===\n")
+str(train)
+
+cat("\n=== DISTRIBUSI TARGET (y) ===\n")
+tabel_y <- table(train$y)
+print(tabel_y)
+print(prop.table(tabel_y))
+
+cat("\n=== JUMLAH 'unknown' PER KOLOM (TRAIN) ===\n")
+unknown_train <- sapply(train, function(x) sum(x == "unknown", na.rm = TRUE))
+print(unknown_train[unknown_train > 0])
+
+cat("\n=== JUMLAH 'unknown' PER KOLOM (TEST) ===\n")
+unknown_test <- sapply(test, function(x) sum(x == "unknown", na.rm = TRUE))
+print(unknown_test[unknown_test > 0])
+
+cat("\n=== STATISTIK DESKRIPTIF NUMERIK ===\n")
+print(summary(train[, sapply(train, is.numeric)]))
+```
+
+# Preprocessing Data
+```{r}
+# Identifikasi kolom karakter
+char_cols_train <- names(train)[sapply(train, is.character)]
+char_cols_test  <- names(test)[sapply(test,  is.character)]
+
+# Ganti "unknown" ke NA hanya di kolom karakter
+for (col in char_cols_train) {
+  train[[col]][train[[col]] == "unknown"] <- NA
+}
+for (col in char_cols_test) {
+  test[[col]][test[[col]] == "unknown"] <- NA
+}
+# Verifikasi
+cat("NA di kolom numerik train:", sum(is.na(train[, sapply(train, is.numeric)])), "\n")
+cat("NA di kolom kategorik train:", sum(is.na(train[, sapply(train, is.character)])), "\n")
+
+# Imputasi NA dengan modus (DARI TRAIN)
+get_mode <- function(x) {
+  x  <- na.omit(x)
+  ux <- unique(x)
+  ux[which.max(tabulate(match(x, ux)))]
+}
+
+# Simpan modus dari train untuk dipakai juga pada test
+modus_train <- list()
+for (col in char_cols_train) {
+  if (any(is.na(train[[col]]))) {
+    modus_train[[col]] <- get_mode(train[[col]])
+    train[[col]][is.na(train[[col]])] <- modus_train[[col]]
+  }
+}
+
+# Imputasi test menggunakan modus dari train
+for (col in char_cols_test) {
+  if (any(is.na(test[[col]]))) {
+    if (!is.null(modus_train[[col]])) {
+      test[[col]][is.na(test[[col]])] <- modus_train[[col]]
+    } else {
+      test[[col]][is.na(test[[col]])] <- get_mode(test[[col]])
+    }
+  }
+}
+
+cat("\nNA tersisa setelah imputasi (Train):", sum(is.na(train)), "\n")
+cat("NA tersisa setelah imputasi (Test):", sum(is.na(test)),   "\n")
+
+# Verifikasi kolom numerik
+num_cols_check <- c("emp.var.rate", "cons.price.idx", "cons.conf.idx", "euribor3m", "nr.employed")
+for (col in num_cols_check) {
+  if (col %in% names(train)) {
+    cat(col, ":", range(train[[col]], na.rm = TRUE), "\n")
+  }
+}
+
+# Feature Engineering
+train$is_contacted_before <- ifelse(train$pdays == 999, "no", "yes")
+test$is_contacted_before  <- ifelse(test$pdays  == 999, "no", "yes")
+
+# Feature Selection
+kolom_hapus <- c("duration", "emp.var.rate", "nr.employed")
+train <- train[, !(names(train) %in% kolom_hapus)]
+test  <- test[,  !(names(test)  %in% kolom_hapus)]
+
+cat("\nVariabel final:\n")
+print(names(train))
+
+# Konversi ke Factor
+char_cols <- names(train)[sapply(train, is.character)]
+train[char_cols] <- lapply(train[char_cols], as.factor)
+char_cols_test <- names(test)[sapply(test, is.character)]
+test[char_cols_test] <- lapply(test[char_cols_test], as.factor)
+
+# Samakan levels test dengan train
+for (col in names(test)) {
+  if (is.factor(test[[col]]) && col %in% names(train) && is.factor(train[[col]])) {
+    test[[col]] <- factor(test[[col]], levels = levels(train[[col]]))
+  }
+}
+
+cat("\nPreprocessing selesai. Cek tipe data:\n")
+str(train)
+```
+
+# Split data dan handle class imbalance
+```{r}
+set.seed(123)
+trainIndex    <- createDataPartition(train$y, p = 0.8, list = FALSE)
+data_train    <- train[ trainIndex, ]
+data_val      <- train[-trainIndex, ]
+
+cat("\nProporsi sebelum downsampling:\n")
+print(prop.table(table(data_train$y)))
+
+train_balanced <- downSample(
+  x     = data_train[, -which(names(data_train) == "y")],
+  y     = data_train$y,
+  yname = "y"
+)
+cat("Setelah downsampling:", table(train_balanced$y), "\n")
+```
+
+# Scaling data
+```{r}
+numeric_cols <- names(train_balanced)[sapply(train_balanced, is.numeric)]
+scaler <- preProcess(
+  train_balanced[, numeric_cols, drop = FALSE],
+  method = c("center", "scale")
+)
+
+scale_df <- function(df, scaler, num_cols) {
+  cols <- intersect(num_cols, names(df))
+  df[, cols] <- predict(scaler, df[, cols, drop = FALSE])
+  df
+}
+
+train_sc <- scale_df(train_balanced, scaler, numeric_cols)
+val_sc   <- scale_df(data_val,       scaler, numeric_cols)
+test_sc  <- scale_df(test,           scaler, numeric_cols)
+```
+
+# Model Development
+```{r}
+# Model Random Forest
+set.seed(123)
+model_rf <- randomForest(
+  y ~ ., data = train_sc,
+  mtry = floor(sqrt(ncol(train_sc) - 1)),
+  ntree = 300,
+  importance = TRUE
+)
+
+# Model SVM
+set.seed(123)
+model_svm <- svm(
+  y ~ ., data = train_sc,
+  kernel = "radial",
+  cost = 1,
+  gamma = 0.1,
+  probability = TRUE
+)
+
+# Model ANN
+set.seed(123)
+model_ann <- nnet(
+  y ~ ., data = train_sc,
+  size = 10,
+  decay = 0.01,
+  maxit = 500,
+  trace = FALSE
+)
+```
+
+# Evaluasi Model
+```{r}
+eval_model <- function(pred, actual, nama) {
+  pred   <- factor(pred, levels = levels(actual))
+  cm     <- confusionMatrix(pred, actual, positive = "yes")
+  f1     <- F1_Score(y_pred = pred, y_true = actual, positive = "yes")
+  data.frame(
+    Model     = nama,
+    Accuracy  = round(cm$overall["Accuracy"],       4),
+    Precision = round(cm$byClass["Pos Pred Value"], 4),
+    Recall    = round(cm$byClass["Sensitivity"],    4),
+    F1_Score  = round(f1, 4),
+    row.names = NULL
+  )
+}
+
+pred_rf  <- predict(model_rf,  newdata = val_sc)
+pred_svm <- predict(model_svm, newdata = val_sc)
+pred_ann <- factor(
+  predict(model_ann, newdata = val_sc, type = "class"),
+  levels = levels(val_sc$y)
+)
+
+hasil_eval <- rbind(
+  eval_model(pred_rf,  val_sc$y, "Random Forest"),
+  eval_model(pred_svm, val_sc$y, "SVM"),
+  eval_model(pred_ann, val_sc$y, "ANN")
+)
+# Tampilkan hasil evaluasi
+cat("\n[ HASIL EVALUASI KOMPARATIF ]\n")
+print(hasil_eval, row.names = FALSE)
+```
+
+# Kalibrasi Treshold
+```{r}
+# Ambil probabilitas dari semua model di data VALIDASI
+# Random Forest
+prob_rf_val  <- predict(model_rf,  newdata = val_sc, type = "prob")[, "yes"]
+
+# SVM (probability = TRUE saat training — sudah di-set)
+prob_svm_raw <- predict(model_svm, newdata = val_sc, probability = TRUE)
+prob_svm_val <- attr(prob_svm_raw, "probabilities")[, "yes"]
+
+# ANN
+prob_ann_val <- as.numeric(predict(model_ann, newdata = val_sc, type = "raw"))
+
+# Fungsi threshold optimal
+find_best_threshold <- function(probs, actual, grid = seq(0.1, 0.9, by = 0.01)) {
+  f1_vals <- sapply(grid, function(t) {
+    pred_t <- factor(ifelse(probs > t, "yes", "no"), levels = levels(actual))
+    tryCatch(
+      F1_Score(y_pred = pred_t, y_true = actual, positive = "yes"),
+      error = function(e) 0
+    )
+  })
+  list(
+    threshold = grid[which.max(f1_vals)],
+    f1        = round(max(f1_vals), 4)
+  )
+}
+
+best_rf  <- find_best_threshold(prob_rf_val,  val_sc$y)
+best_svm <- find_best_threshold(prob_svm_val, val_sc$y)
+best_ann <- find_best_threshold(prob_ann_val, val_sc$y)
+
+cat("Random Forest — Threshold:", best_rf$threshold,  "| F1:", best_rf$f1,  "\n")
+cat("SVM           — Threshold:", best_svm$threshold, "| F1:", best_svm$f1, "\n")
+cat("ANN           — Threshold:", best_ann$threshold, "| F1:", best_ann$f1, "\n")
+
+# Evaluasi ulang
+eval_with_threshold <- function(probs, actual, threshold, nama) {
+  pred <- factor(ifelse(probs > threshold, "yes", "no"), levels = levels(actual))
+  cm   <- confusionMatrix(pred, actual, positive = "yes")
+  f1   <- F1_Score(y_pred = pred, y_true = actual, positive = "yes")
+  data.frame(
+    Model       = nama,
+    Threshold   = threshold,
+    Accuracy    = round(cm$overall["Accuracy"],       4),
+    Precision   = round(cm$byClass["Pos Pred Value"], 4),
+    Recall      = round(cm$byClass["Sensitivity"],    4),
+    F1_Score    = round(f1, 4),
+    row.names   = NULL
+  )
+}
+
+hasil_kalibrasi <- rbind(
+  eval_with_threshold(prob_rf_val,  val_sc$y, best_rf$threshold,  "Random Forest (Kalibrasi)"),
+  eval_with_threshold(prob_svm_val, val_sc$y, best_svm$threshold, "SVM (Kalibrasi)"),
+  eval_with_threshold(prob_ann_val, val_sc$y, best_ann$threshold, "ANN (Kalibrasi)")
+)
+
+cat("\n=== HASIL EVALUASI SETELAH KALIBRASI THRESHOLD ===\n")
+print(hasil_kalibrasi, row.names = FALSE)
+
+# Confusion matrix model terbaik (SVM)
+pred_svm_best <- factor(
+  ifelse(prob_svm_val > best_svm$threshold, "yes", "no"),
+  levels = levels(val_sc$y)
+)
+cat("\n=== CONFUSION MATRIX — SVM (Model Terbaik) ===\n")
+print(confusionMatrix(pred_svm_best, val_sc$y, positive = "yes"))
+```
+
+# Prediksi Final dan Submission
+```{r}
+
+# Konfirmasi model terbaik
+cat("=== PERBANDINGAN FINAL SETELAH KALIBRASI ===\n")
+cat("Random Forest — Threshold: 0.73 | F1: 0.4943 ← TERPILIH\n")
+cat("SVM           — Threshold: 0.78 | F1: 0.4935\n")
+cat("ANN           — Threshold: 0.77 | F1: 0.4596\n")
+
+# Ambil probabilitas RF pada Dataset B
+prob_rf_test <- predict(model_rf, newdata = test_sc, type = "prob")[, "yes"]
+
+# Terapkan threshold optimal RF
+prediksi_final_rf <- factor(
+  ifelse(prob_rf_test > 0.73, "yes", "no"),
+  levels = c("no", "yes")
+)
+
+# Buat dataframe submission
+hasil_submission_rf <- data.frame(
+  id     = seq_len(nrow(test_sc)),
+  y_pred = prediksi_final_rf
+)
+
+# Cek distribusi prediksi
+cat("\n=== DISTRIBUSI PREDIKSI DATASET B (Random Forest - Final) ===\n")
+print(table(hasil_submission_rf$y_pred))
+cat("\nProporsi:\n")
+print(round(prop.table(table(hasil_submission_rf$y_pred)), 3))
+# Ekspektasi: "yes" ~10-18%
+
+# Preview
+cat("\nPreview 10 baris pertama:\n")
+print(head(hasil_submission_rf, 10))
+
+# Export ke CSV
+write.csv(hasil_submission_rf,
+          "Hasil_Prediksi_Dataset_B_RF_FINAL.csv",
+          row.names = FALSE,
+          quote     = FALSE)
+
+cat("\n[SELESAI] File 'Hasil_Prediksi_Dataset_B_RF_FINAL.csv' berhasil disimpan!\n")
+```
+
+```{r}
+# ── 1. SCALING ULANG dari data_train asli ────────────────────────────────
+numeric_cols <- names(data_train)[sapply(data_train, is.numeric)]
+
+scaler_fix <- preProcess(data_train[, numeric_cols, drop = FALSE],
+                         method = c("center", "scale"))
+
+scale_df <- function(df, scaler, num_cols) {
+  cols <- intersect(num_cols, names(df))
+  df[, cols] <- predict(scaler, df[, cols, drop = FALSE])
+  df
+}
+
+train_fix_sc <- scale_df(data_train, scaler_fix, numeric_cols)
+val_fix_sc   <- scale_df(data_val,   scaler_fix, numeric_cols)
+test_fix_sc  <- scale_df(test,       scaler_fix, numeric_cols)
+
+# ── 2. BANGUN MODEL RF DENGAN CLASS WEIGHT ───────────────────────────────
+bobot_no  <- 1 / sum(data_train$y == "no")
+bobot_yes <- 1 / sum(data_train$y == "yes")
+
+set.seed(123)
+model_rf_fix <- randomForest(
+  y ~ .,
+  data      = train_fix_sc,
+  mtry      = floor(sqrt(ncol(train_fix_sc) - 1)),
+  ntree     = 300,
+  classwt   = c("no" = bobot_no, "yes" = bobot_yes),
+  importance = TRUE
+)
+
+# ── 3. KALIBRASI THRESHOLD ───────────────────────────────────────────────
+prob_rf_val_fix <- predict(model_rf_fix, newdata = val_fix_sc, type = "prob")[, "yes"]
+
+threshold_grid <- seq(0.10, 0.90, by = 0.01)
+f1_grid <- sapply(threshold_grid, function(t) {
+  pred_t <- factor(ifelse(prob_rf_val_fix > t, "yes", "no"),
+                   levels = levels(val_fix_sc$y))
+  tryCatch(
+    F1_Score(y_pred = pred_t, y_true = val_fix_sc$y, positive = "yes"),
+    error = function(e) 0
+  )
+})
+
+best_t  <- threshold_grid[which.max(f1_grid)]
+best_f1 <- round(max(f1_grid), 4)
+cat("Threshold Optimal:", best_t, "| F1:", best_f1, "\n")
+
+# ── 4. EVALUASI DI DATA VALIDASI ─────────────────────────────────────────
+pred_val_fix <- factor(
+  ifelse(prob_rf_val_fix > best_t, "yes", "no"),
+  levels = levels(val_fix_sc$y)
+)
+cm_fix <- confusionMatrix(pred_val_fix, val_fix_sc$y, positive = "yes")
+print(cm_fix)
+
+# ── 5. PREDIKSI DATASET B ────────────────────────────────────────────────
+prob_test_fix <- predict(model_rf_fix, newdata = test_fix_sc, type = "prob")[, "yes"]
+
+prediksi_fix <- factor(
+  ifelse(prob_test_fix > best_t, "yes", "no"),
+  levels = c("no", "yes")
+)
+
+cat("\n=== DISTRIBUSI PREDIKSI DATASET B (SETELAH PERBAIKAN) ===\n")
+print(table(prediksi_fix))
+cat("\nProporsi:\n")
+print(round(prop.table(table(prediksi_fix)), 3))
+# Harusnya: "yes" ~ 0.10 - 0.18
+
+# ── 6. EXPORT ─────────────────────────────────────────────────────────────
+hasil_final <- data.frame(
+  id     = seq_len(nrow(test_fix_sc)),
+  y_pred = prediksi_fix
+)
+
+write.csv(hasil_final,
+          "Hasil_Prediksi_Dataset_B_FINAL.csv",
+          row.names = FALSE,
+          quote     = FALSE)
+
+cat("\n[SELESAI] File berhasil disimpan!\n")
+```
+
+```{r}
+# ============================================================
+# SOLUSI FINAL: RF TANPA RESAMPLING, TANPA CLASS WEIGHT
+# ============================================================
+
+# ── 1. SCALING dari data_train ASLI ──────────────────────────────────────
+numeric_cols <- names(data_train)[sapply(data_train, is.numeric)]
+
+scaler_final <- preProcess(data_train[, numeric_cols, drop = FALSE],
+                            method = c("center", "scale"))
+
+scale_df <- function(df, scaler, num_cols) {
+  cols <- intersect(num_cols, names(df))
+  df[, cols] <- predict(scaler, df[, cols, drop = FALSE])
+  df
+}
+
+train_final_sc <- scale_df(data_train, scaler_final, numeric_cols)
+val_final_sc   <- scale_df(data_val,   scaler_final, numeric_cols)
+test_final_sc  <- scale_df(test,       scaler_final, numeric_cols)
+
+cat("Distribusi kelas TRAIN (asli, tanpa resampling):\n")
+print(prop.table(table(train_final_sc$y)))
+# Harusnya: no ~0.88, yes ~0.12
+
+# ── 2. BANGUN MODEL RF — MURNI TANPA MANIPULASI ──────────────────────────
+set.seed(123)
+model_rf_final <- randomForest(
+  y ~ .,
+  data       = train_final_sc,
+  mtry       = floor(sqrt(ncol(train_final_sc) - 1)),
+  ntree      = 500,
+  importance = TRUE
+  # TIDAK ada classwt, TIDAK ada resampling
+)
+
+cat("\nModel RF (tanpa resampling) selesai dibangun.\n")
+
+# ── 3. CEK PROBABILITAS DI VALIDASI ──────────────────────────────────────
+prob_rf_final_val <- predict(model_rf_final, 
+                              newdata = val_final_sc, 
+                              type = "prob")[, "yes"]
+
+cat("\nRingkasan probabilitas prediksi (validasi):\n")
+print(summary(prob_rf_final_val))
+# Harusnya: mean ~0.10-0.15, max ~0.70-0.90
+
+# ── 4. KALIBRASI THRESHOLD OPTIMAL ───────────────────────────────────────
+threshold_grid <- seq(0.10, 0.60, by = 0.01)
+
+f1_grid <- sapply(threshold_grid, function(t) {
+  pred_t <- factor(ifelse(prob_rf_final_val > t, "yes", "no"),
+                   levels = levels(val_final_sc$y))
+  tryCatch(
+    F1_Score(y_pred = pred_t, y_true = val_final_sc$y, positive = "yes"),
+    error = function(e) 0
+  )
+})
+
+best_t_final  <- threshold_grid[which.max(f1_grid)]
+best_f1_final <- round(max(f1_grid), 4)
+
+cat("\nThreshold Optimal:", best_t_final, "| F1:", best_f1_final, "\n")
+
+# ── 5. EVALUASI DETAIL DI VALIDASI ───────────────────────────────────────
+pred_val_final <- factor(
+  ifelse(prob_rf_final_val > best_t_final, "yes", "no"),
+  levels = levels(val_final_sc$y)
+)
+
+cm_final <- confusionMatrix(pred_val_final, val_final_sc$y, positive = "yes")
+f1_final <- F1_Score(y_pred = pred_val_final, 
+                      y_true = val_final_sc$y, 
+                      positive = "yes")
+
+cat("\n=== CONFUSION MATRIX — RF FINAL ===\n")
+print(cm_final)
+
+cat("\n=== METRIK EVALUASI FINAL ===\n")
+cat("Accuracy :", round(cm_final$overall["Accuracy"], 4), "\n")
+cat("Precision:", round(cm_final$byClass["Pos Pred Value"], 4), "\n")
+cat("Recall   :", round(cm_final$byClass["Sensitivity"], 4), "\n")
+cat("F1-Score :", round(f1_final, 4), "\n")
+
+# ── 6. PREDIKSI DATASET B ────────────────────────────────────────────────
+prob_test_final <- predict(model_rf_final, 
+                            newdata = test_final_sc, 
+                            type = "prob")[, "yes"]
+
+prediksi_final <- factor(
+  ifelse(prob_test_final > best_t_final, "yes", "no"),
+  levels = c("no", "yes")
+)
+
+cat("\n=== DISTRIBUSI PREDIKSI DATASET B ===\n")
+print(table(prediksi_final))
+cat("\nProporsi:\n")
+print(round(prop.table(table(prediksi_final)), 3))
+# TARGET: "yes" ~ 0.10 - 0.18
+
+# ── 7. EXPORT ─────────────────────────────────────────────────────────────
+hasil_final_clean <- data.frame(
+  id     = seq_len(nrow(test_final_sc)),
+  y_pred = prediksi_final
+)
+
+cat("\nPreview 10 baris:\n")
+print(head(hasil_final_clean, 10))
+
+write.csv(hasil_final_clean,
+          "Hasil_Prediksi_Dataset_B_FINAL.csv",
+          row.names = FALSE,
+          quote     = FALSE)
+
+cat("\n[SELESAI] File berhasil disimpan!\n")
+```
+
+```{r}
+# ============================================================
+# INVESTIGASI: KENAPA DATASET B BERBEDA?
+# ============================================================
+
+# ── Bandingkan distribusi numerik A vs B ─────────────────────
+cat("=== PERBANDINGAN KARAKTERISTIK DATASET A vs B ===\n\n")
+
+num_vars <- c("euribor3m", "cons.price.idx", "cons.conf.idx",
+              "age", "campaign", "pdays", "previous")
+
+for (v in num_vars) {
+  if (v %in% names(data_train) && v %in% names(test)) {
+    cat(sprintf("%-20s | Train mean: %7.3f | Test mean: %7.3f\n",
+                v,
+                mean(data_train[[v]], na.rm = TRUE),
+                mean(test[[v]], na.rm = TRUE)))
+  }
+}
+
+# ── Bandingkan distribusi kategorik penting ───────────────────
+cat("\n=== POUTCOME (Hasil Kampanye Sebelumnya) ===\n")
+cat("Train:\n"); print(round(prop.table(table(data_train$poutcome)), 3))
+cat("Test:\n");  print(round(prop.table(table(test$poutcome)), 3))
+
+cat("\n=== CONTACT (Jenis Komunikasi) ===\n")
+cat("Train:\n"); print(round(prop.table(table(data_train$contact)), 3))
+cat("Test:\n");  print(round(prop.table(table(test$contact)), 3))
+
+cat("\n=== IS_CONTACTED_BEFORE ===\n")
+cat("Train:\n"); print(round(prop.table(table(data_train$is_contacted_before)), 3))
+cat("Test:\n");  print(round(prop.table(table(test$is_contacted_before)), 3))
+
+cat("\n=== MONTH (Bulan Kampanye) ===\n")
+cat("Train:\n"); print(round(prop.table(table(data_train$month)), 3))
+cat("Test:\n");  print(round(prop.table(table(test$month)), 3))
+
+# ── Distribusi probabilitas prediksi Dataset B ────────────────
+cat("\n=== RINGKASAN PROBABILITAS PREDIKSI DATASET B ===\n")
+print(summary(prob_test_final))
+
+# Histogram probabilitas
+hist(prob_test_final,
+     breaks = 50,
+     main   = "Distribusi Probabilitas Prediksi - Dataset B",
+     xlab   = "P(yes)",
+     col    = "steelblue",
+     border = "white")
+abline(v = best_t_final, col = "red", lwd = 2, lty = 2)
+legend("topright", legend = paste("Threshold =", best_t_final),
+       col = "red", lty = 2, lwd = 2)
+```
+
+```{r}
+# Cek cepat nama kolom test vs train
+cat("Kolom di train_final_sc:\n"); print(sort(names(train_final_sc)))
+cat("\nKolom di test_final_sc:\n");  print(sort(names(test_final_sc)))
+cat("\nAda di test tapi tidak di train:\n")
+print(setdiff(names(test_final_sc), names(train_final_sc)))
+```

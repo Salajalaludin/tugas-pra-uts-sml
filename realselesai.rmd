@@ -1,0 +1,447 @@
+---
+title: "Statistical Methods for Machine Learning - Final Project"
+subtitle: "Klasifikasi Deposito Berjangka Bank"
+author: "Sala Jalaludin"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float:
+      collapsed: false
+      smooth_scroll: true
+    theme: cosmo
+    highlight: tango
+---
+
+# Load Libraries
+```{r}
+library(caret)
+library(randomForest)
+library(e1071)
+library(MLmetrics)
+library(nnet)
+```
+
+# Input Data
+```{r}
+dataset_A <- read.csv("dataset_A.csv", stringsAsFactors = FALSE)
+dataset_B <- read.csv("dataset_B.csv", stringsAsFactors = FALSE)
+cat("Dimensi Dataset A:", dim(dataset_A), "\n")
+cat("Dimensi Dataset B:", dim(dataset_B), "\n")
+```
+
+# Exploratory Data Analysis (EDA)
+
+## Stuktur Data
+```{r}
+str(dataset_A)
+```
+
+## Distribusi Kelas Target
+```{r}
+tabel_y <- table(dataset_A$y)
+cat("DISTRIBUSI TARGET (y)\n")
+print(tabel_y)
+cat("\nProporsi:\n")
+print(round(prop.table(tabel_y), 4))
+barplot(tabel_y,
+        main = "Distribusi Kelas Target (y)",
+        col  = c("steelblue", "tomato"),
+        ylab = "Jumlah Nasabah",
+        xlab = "Berlangganan Deposito")
+```
+
+## Missing Values
+```{r}
+cat("JUMLAH 'unknown' PER KOLOM (DATASET A)\n")
+unknown_A <- sapply(dataset_A, function(x) sum(x == "unknown", na.rm = TRUE))
+print(unknown_A[unknown_A > 0])
+cat("\nJUMLAH 'unknown' PER KOLOM (DATASET B)\n")
+unknown_B <- sapply(dataset_B, function(x) sum(x == "unknown", na.rm = TRUE))
+print(unknown_B[unknown_B > 0])
+```
+## Statistik Deskriptif
+```{r}
+print(summary(dataset_A[, sapply(dataset_A, is.numeric)]))
+```
+
+# Preprocessing Data
+
+## Handling Missing Values
+```{r}
+# Identifikasi kolom karakter
+char_cols_A <- names(dataset_A)[sapply(dataset_A, is.character)]
+char_cols_B <- names(dataset_B)[sapply(dataset_B, is.character)]
+
+# Ganti "unknown" ke NA hanya di kolom karakter
+for (col in char_cols_A) {
+  dataset_A[[col]][dataset_A[[col]] == "unknown"] <- NA
+}
+for (col in char_cols_B) {
+  dataset_B[[col]][dataset_B[[col]] == "unknown"] <- NA
+}
+
+# Verifikasi
+cat("NA di kolom numerik Dataset A  :", sum(is.na(dataset_A[, sapply(dataset_A, is.numeric)])), "\n")
+cat("NA di kolom kategorik Dataset A:", sum(is.na(dataset_A[, sapply(dataset_A, is.character)])), "\n")
+# Fungsi modus
+get_mode <- function(x) {
+  x  <- na.omit(x)
+  ux <- unique(x)
+  ux[which.max(tabulate(match(x, ux)))]
+}
+
+# Imputasi NA dengan modus dari DATASET A (anti data leakage)
+modus_A <- list()
+for (col in char_cols_A) {
+  if (any(is.na(dataset_A[[col]]))) {
+    modus_A[[col]] <- get_mode(dataset_A[[col]])
+    dataset_A[[col]][is.na(dataset_A[[col]])] <- modus_A[[col]]
+  }
+}
+
+# Terapkan modus DATASET A ke DATASET B
+for (col in char_cols_B) {
+  if (any(is.na(dataset_B[[col]]))) {
+    val_impute <- if (!is.null(modus_A[[col]])) modus_A[[col]] else get_mode(dataset_B[[col]])
+    dataset_B[[col]][is.na(dataset_B[[col]])] <- val_impute
+  }
+}
+
+cat("\nNA tersisa setelah imputasi (Dataset A):", sum(is.na(dataset_A)), "\n")
+cat("NA tersisa setelah imputasi (Dataset B):", sum(is.na(dataset_B)), "\n")
+```
+
+## Feature Engineering
+```{r}
+# Buat variabel biner dari pdays
+# pdays = 999 -> nasabah tidak pernah dihubungi sebelumnya
+dataset_A$is_contacted_before <- ifelse(dataset_A$pdays == 999, "no", "yes")
+dataset_B$is_contacted_before <- ifelse(dataset_B$pdays == 999, "no", "yes")
+
+cat("Distribusi is_contacted_before (Dataset A):\n")
+print(prop.table(table(dataset_A$is_contacted_before)))
+```
+
+## Feature Selection & Anti Data Leakage
+```{r}
+# Variabel yang dihapus:
+# - duration      : data leakage (hanya diketahui SETELAH panggilan)
+# - emp.var.rate  : multikolinearitas tinggi dengan euribor3m
+# - nr.employed   : multikolinearitas tinggi dengan euribor3m
+
+kolom_hapus <- c("duration", "emp.var.rate", "nr.employed")
+dataset_A <- dataset_A[, !(names(dataset_A) %in% kolom_hapus)]
+dataset_B <- dataset_B[, !(names(dataset_B) %in% kolom_hapus)]
+
+cat("Variabel final setelah feature selection:\n")
+print(names(dataset_A))
+```
+
+## Encoding & Konversi Tipe Data
+```{r}
+# Ubah kolom karakter menjadi factor
+char_cols_A <- names(dataset_A)[sapply(dataset_A, is.character)]
+dataset_A[char_cols_A] <- lapply(dataset_A[char_cols_A], as.factor)
+char_cols_B <- names(dataset_B)[sapply(dataset_B, is.character)]
+dataset_B[char_cols_B] <- lapply(dataset_B[char_cols_B], as.factor)
+
+# Samakan levels Dataset B dengan Dataset A agar prediksi tidak error
+for (col in names(dataset_B)) {
+  if (is.factor(dataset_B[[col]]) && col %in% names(dataset_A) && is.factor(dataset_A[[col]])) {
+    dataset_B[[col]] <- factor(dataset_B[[col]], levels = levels(dataset_A[[col]]))
+  }
+}
+
+cat("Preprocessing selesai.\n")
+str(dataset_A)
+```
+
+# Split Data & Imbalance Handling
+```{r}
+set.seed(123)
+trainIndex <- createDataPartition(dataset_A$y, p = 0.8, list = FALSE)
+data_train <- dataset_A[ trainIndex, ]
+data_val   <- dataset_A[-trainIndex, ]
+
+cat("Ukuran data train   :", nrow(data_train), "\n")
+cat("Ukuran data validasi:", nrow(data_val),   "\n")
+cat("\nProporsi kelas (data train asli):\n")
+print(round(prop.table(table(data_train$y)), 4))
+```
+
+**Catatan penanganan class imbalance:** Setelah mengevaluasi tiga pendekatan 
+  
+  downsampling (50/50), class weight terbalik, dan tanpa resampling, ditemukan bahwa model Random Forest yang dilatih pada distribusi data **asli (88/12)** menghasilkan F1-Score tertinggi dan distribusi prediksi yang paling dapat dipertanggungjawabkan. Downsampling dan class weight justru mendistorsi probabilitas output model secara signifikan.
+
+# Scaling Data
+```{r}
+numeric_cols <- names(data_train)[sapply(data_train, is.numeric)]
+
+# Buat aturan scaling dari data TRAIN asli
+scaler_final <- preProcess(data_train[, numeric_cols, drop = FALSE],
+                            method = c("center", "scale"))
+
+# Fungsi helper untuk menerapkan scaling
+scale_df <- function(df, scaler, num_cols) {
+  cols <- intersect(num_cols, names(df))
+  df[, cols] <- predict(scaler, df[, cols, drop = FALSE])
+  df
+}
+
+train_sc <- scale_df(data_train, scaler_final, numeric_cols)
+val_sc   <- scale_df(data_val,   scaler_final, numeric_cols)
+test_sc  <- scale_df(dataset_B,  scaler_final, numeric_cols)
+
+cat("Scaling selesai diterapkan pada Train, Validasi, dan Dataset B.\n")
+cat("Contoh statistik setelah scaling (train):\n")
+print(summary(train_sc[, numeric_cols]))
+```
+
+# Pengembangan Model
+
+## Model Random Forest
+```{r}
+set.seed(123)
+model_rf <- randomForest(
+  y ~ .,
+  data       = train_sc,
+  mtry       = floor(sqrt(ncol(train_sc) - 1)),
+  ntree      = 500,
+  importance = TRUE
+)
+
+cat("Random Forest selesai dibangun.\n")
+print(model_rf)
+```
+
+## Model SVM
+```{r}
+set.seed(123)
+model_svm <- svm(
+  y ~ .,
+  data        = train_sc,
+  kernel      = "radial",
+  cost        = 1,
+  gamma       = 0.1,
+  probability = TRUE
+)
+
+cat("SVM selesai dibangun.\n")
+print(model_svm)
+```
+
+## Model ANN
+```{r}
+set.seed(123)
+model_ann <- nnet(
+  y ~ .,
+  data  = train_sc,
+  size  = 10,
+  decay = 0.01,
+  maxit = 500,
+  trace = FALSE
+)
+cat("ANN selesai dibangun.\n")
+print(model_ann)
+```
+
+# Evaluasi Model
+
+## Evaluasi Default (Threshold 0.5)
+```{r}
+# Fungsi helper evaluasi
+eval_model <- function(pred, actual, nama) {
+  pred <- factor(pred, levels = levels(actual))
+  cm   <- confusionMatrix(pred, actual, positive = "yes")
+  f1   <- F1_Score(y_pred = pred, y_true = actual, positive = "yes")
+  data.frame(
+    Model     = nama,
+    Accuracy  = round(cm$overall["Accuracy"],       4),
+    Precision = round(cm$byClass["Pos Pred Value"], 4),
+    Recall    = round(cm$byClass["Sensitivity"],    4),
+    F1_Score  = round(f1, 4),
+    row.names = NULL
+  )
+}
+
+# Prediksi di data validasi
+pred_rf  <- predict(model_rf,  newdata = val_sc)
+pred_svm <- predict(model_svm, newdata = val_sc)
+pred_ann <- factor(
+  predict(model_ann, newdata = val_sc, type = "class"),
+  levels = levels(val_sc$y)
+)
+
+# Tabel komparatif
+hasil_eval <- rbind(
+  eval_model(pred_rf,  val_sc$y, "Random Forest"),
+  eval_model(pred_svm, val_sc$y, "SVM"),
+  eval_model(pred_ann, val_sc$y, "ANN")
+)
+
+cat("HASIL EVALUASI — THRESHOLD DEFAULT (0.5)\n")
+print(hasil_eval, row.names = FALSE)
+```
+
+## Evaluasi dengan Kalibrasi Threshold
+```{r}
+# Ambil probabilitas prediksi dari setiap model
+prob_rf_val  <- predict(model_rf,  newdata = val_sc, type = "prob")[, "yes"]
+prob_svm_raw <- predict(model_svm, newdata = val_sc, probability = TRUE)
+prob_svm_val <- attr(prob_svm_raw, "probabilities")[, "yes"]
+prob_ann_val <- as.numeric(predict(model_ann, newdata = val_sc, type = "raw"))
+
+# Fungsi cari threshold optimal berdasarkan F1-Score tertinggi
+find_best_threshold <- function(probs, actual, grid = seq(0.10, 0.90, by = 0.01)) {
+  f1_vals <- sapply(grid, function(t) {
+    pred_t <- factor(ifelse(probs > t, "yes", "no"), levels = levels(actual))
+    tryCatch(
+      F1_Score(y_pred = pred_t, y_true = actual, positive = "yes"),
+      error = function(e) 0
+    )
+  })
+  list(threshold = grid[which.max(f1_vals)],
+       f1        = round(max(f1_vals), 4))
+}
+
+best_rf  <- find_best_threshold(prob_rf_val,  val_sc$y)
+best_svm <- find_best_threshold(prob_svm_val, val_sc$y)
+best_ann <- find_best_threshold(prob_ann_val, val_sc$y)
+
+cat("Random Forest — Threshold:", best_rf$threshold,  "| F1:", best_rf$f1,  "\n")
+cat("SVM           — Threshold:", best_svm$threshold, "| F1:", best_svm$f1, "\n")
+cat("ANN           — Threshold:", best_ann$threshold, "| F1:", best_ann$f1, "\n")
+```
+
+## Evaluasi Perbandingan Sebelum vs Sesudah Kalibrasi
+```{r}
+eval_with_threshold <- function(probs, actual, threshold, nama) {
+  pred <- factor(ifelse(probs > threshold, "yes", "no"), levels = levels(actual))
+  cm   <- confusionMatrix(pred, actual, positive = "yes")
+  f1   <- F1_Score(y_pred = pred, y_true = actual, positive = "yes")
+  data.frame(
+    Model     = nama,
+    Threshold = threshold,
+    Accuracy  = round(cm$overall["Accuracy"],       4),
+    Precision = round(cm$byClass["Pos Pred Value"], 4),
+    Recall    = round(cm$byClass["Sensitivity"],    4),
+    F1_Score  = round(f1, 4),
+    row.names = NULL
+  )
+}
+
+hasil_kalibrasi <- rbind(
+  eval_with_threshold(prob_rf_val,  val_sc$y, best_rf$threshold,  "Random Forest (Kalibrasi)"),
+  eval_with_threshold(prob_svm_val, val_sc$y, best_svm$threshold, "SVM (Kalibrasi)"),
+  eval_with_threshold(prob_ann_val, val_sc$y, best_ann$threshold, "ANN (Kalibrasi)")
+)
+cat("HASIL EVALUASI SETELAH KALIBRASI THRESHOLD\n")
+print(hasil_kalibrasi, row.names = FALSE)
+```
+
+## Confusion Matrix Model Terbaik
+```{r}
+# ANN adalah model terbaik berdasarkan F1-Score setelah kalibrasi
+pred_ann_best <- factor(
+  ifelse(prob_ann_val > best_ann$threshold, "yes", "no"),
+  levels = levels(val_sc$y)
+)
+
+cat("CONFUSION MATRIX — ANN (Model Terbaik)\n")
+print(confusionMatrix(pred_ann_best, val_sc$y, positive = "yes"))
+```
+
+## Variable Importance
+```{r}
+varImpPlot(model_rf,
+           main = "Variable Importance — Random Forest",
+           col  = "steelblue")
+```
+
+# Pemilihan Model Terbaik
+```{r}
+# Tabel perbandingan lengkap
+tabel_final <- data.frame(
+  Model     = c("Random Forest", "SVM", "ANN",
+                "Random Forest (Kalibrasi)", "SVM (Kalibrasi)", "ANN (Kalibrasi)"),
+  Threshold = c(0.50, 0.50, 0.50,
+                best_rf$threshold, best_svm$threshold, best_ann$threshold),
+  Accuracy  = c(hasil_eval$Accuracy,  hasil_kalibrasi$Accuracy),
+  Precision = c(hasil_eval$Precision, hasil_kalibrasi$Precision),
+  Recall    = c(hasil_eval$Recall,    hasil_kalibrasi$Recall),
+  F1_Score  = c(hasil_eval$F1_Score,  hasil_kalibrasi$F1_Score)
+)
+
+cat("=== TABEL PERBANDINGAN LENGKAP ===\n")
+print(tabel_final, row.names = FALSE)
+cat("\n★ MODEL TERPILIH : ANN (Kalibrasi) dengan Threshold", best_ann$threshold, "\n")
+cat("  F1-Score        :", best_ann$f1, "\n")
+cat("  Alasan          : F1-Score tertinggi setelah kalibrasi threshold,\n")
+cat("                    unggul tipis dari Random Forest (0.4977 vs 0.4948).\n")
+```
+
+# Prediksi pada Dataset B & Submission
+```{r}
+# Prediksi probabilitas pada Dataset B menggunakan model terbaik (ANN)
+prob_test_final <- as.numeric(predict(model_ann, newdata = test_sc, type = "raw"))
+# Terapkan threshold optimal
+prediksi_final <- factor(
+  ifelse(prob_test_final > best_ann$threshold, "yes", "no"),
+  levels = c("no", "yes")
+)
+# Distribusi hasil prediksi
+cat("=== DISTRIBUSI PREDIKSI DATASET B ===\n")
+print(table(prediksi_final))
+cat("\nProporsi:\n")
+print(round(prop.table(table(prediksi_final)), 3))
+# Histogram probabilitas prediksi
+hist(prob_test_final,
+     breaks = 50,
+     main   = "Distribusi Probabilitas Prediksi — Dataset B",
+     xlab   = "P(yes)",
+     col    = "steelblue",
+     border = "white")
+abline(v = best_rf$threshold, col = "red", lwd = 2, lty = 2)
+legend("topright",
+       legend = paste("Threshold =", best_rf$threshold),
+       col = "red", lty = 2, lwd = 2)
+# Buat dataframe submission
+hasil_submission <- data.frame(
+  id     = seq_len(nrow(test_sc)),
+  y_pred = prediksi_final
+)
+cat("\nPreview 10 baris pertama:\n")
+print(head(hasil_submission, 10))
+# Export ke CSV
+write.csv(hasil_submission,
+          "Hasil_Prediksi_Dataset_B.csv",
+          row.names = FALSE,
+          quote     = FALSE)
+cat("\nFile 'Hasil_Prediksi_Dataset_B.csv' berhasil disimpan!\n")
+```
+
+# Investigasi Covariate Shift (Dataset B)
+```{r}
+# Variabel numerik
+num_vars <- c("euribor3m", "cons.price.idx", "cons.conf.idx",
+              "age", "campaign", "pdays", "previous")
+for (v in num_vars) {
+  if (v %in% names(data_train) && v %in% names(dataset_B)) {
+    cat(sprintf("%-20s | Dataset A mean: %8.3f | Dataset B mean: %8.3f\n",
+                v,
+                mean(data_train[[v]],  na.rm = TRUE),
+                mean(dataset_B[[v]],   na.rm = TRUE)))
+  }
+}
+# Variabel kategorik kunci
+cat("\n=== POUTCOME (Hasil Kampanye Sebelumnya) ===\n")
+cat("Dataset A:\n"); print(round(prop.table(table(data_train$poutcome)), 3))
+cat("Dataset B:\n"); print(round(prop.table(table(dataset_B$poutcome)), 3))
+cat("\n=== IS_CONTACTED_BEFORE ===\n")
+cat("Dataset A:\n"); print(round(prop.table(table(data_train$is_contacted_before)), 3))
+cat("Dataset B:\n"); print(round(prop.table(table(dataset_B$is_contacted_before)), 3))
+```
+
+Kesimpulan Covariate Shift: Dataset B memiliki proporsi poutcome = success (~9.8%) dan is_contacted_before = yes (~10.5%) yang masing-masing 2.6x lebih tinggi dibanding Dataset A. Kedua variabel ini adalah prediktor terkuat dalam model. Hal ini menyebabkan proporsi prediksi "yes" pada Dataset B lebih tinggi dari Dataset A.
